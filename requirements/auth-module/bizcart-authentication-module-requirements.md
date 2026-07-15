@@ -96,6 +96,9 @@ The first version will not include:
 
 The system must allow a registered user to log in using an email and password.
 
+Login request validation must check that email is valid and that password is present within the allowed length.
+Login must not enforce registration password-complexity rules before password verification.
+
 #### Login Flow
 
 1. User submits email and password.
@@ -108,21 +111,24 @@ The system must allow a registered user to log in using an email and password.
 8. System stores the hashed refresh token.
 9. System updates `last_login_at`.
 10. System records the successful login attempt.
-11. System returns tokens and safe user details.
+11. System returns the access token and safe user details.
+12. System sends the raw refresh token only in a secure HTTP-only cookie.
 
 #### Login Response Must Include
 
 - Access token
-- Refresh token
 - Access-token expiry
 - Refresh-token expiry
 - User ID
+- Username
 - First name
 - Last name
 - Email
 - User type
 - Roles
 - Permissions
+
+The refresh token must not be returned in the JSON response body.
 
 ---
 
@@ -153,6 +159,7 @@ The refresh token must:
 
 - Have a longer expiry than the access token
 - Be stored as a hash, not as plain text
+- Be transported to clients in an HTTP-only cookie
 - Be linked to a user
 - Support multiple devices
 - Support revocation
@@ -168,7 +175,7 @@ The system must allow a user to obtain new tokens using a valid refresh token.
 
 #### Refresh Flow
 
-1. User submits the refresh token.
+1. User submits the refresh token through the configured HTTP-only refresh-token cookie.
 2. System hashes and searches for the token.
 3. System checks whether the token exists.
 4. System checks whether it is expired.
@@ -180,6 +187,33 @@ The system must allow a user to obtain new tokens using a valid refresh token.
 10. System returns the new tokens.
 
 Refresh-token rotation must be implemented.
+
+The refresh-token endpoint must be public at the Spring Security access-token layer because users may refresh after
+the access token expires. The refresh token itself must still be validated by the authentication service.
+
+---
+
+### FR-AUTH-004A — Public Registration
+
+The system must allow public registration for customers and sellers.
+
+The registration request must contain:
+
+- First name
+- Last name
+- Username
+- Email
+- Optional phone
+- Password
+- Confirm password
+- User type
+
+Public registration must allow only `CUSTOMER` and `SELLER`.
+Public registration must not allow `ADMIN`.
+The system must check duplicate email and username before creating the user.
+Database unique-constraint violations for duplicate email or username must be converted to `409 Conflict` responses.
+Newly registered users must start as `PENDING` and `email_verified=false`.
+Seller accounts must require admin approval before protected seller access.
 
 ---
 
@@ -439,9 +473,18 @@ The record should contain:
 - Must have a valid email format
 - Maximum length: 255 characters
 
+### 8.1A Username
+
+- Required for registration
+- Trimmed and normalized before persistence
+- Must be unique
+- Minimum length: 3 characters
+- Maximum length: 50 characters
+- May contain letters, numbers, dots, underscores and hyphens
+
 ### 8.2 Password
 
-A password must:
+A registration, reset-password or change-password password must:
 
 - Be required
 - Have at least 8 characters
@@ -451,6 +494,14 @@ A password must:
 - Include at least one number
 - Include at least one special character
 - Not contain leading or trailing spaces
+
+A login password must:
+
+- Be required
+- Have at least 8 characters
+- Have no more than 64 characters
+
+Login must not reject a password only because it does not match the registration complexity pattern.
 
 ### 8.3 Confirm Password
 
@@ -524,7 +575,10 @@ All endpoints must use a consistent error-response structure.
 | 403 | AUTH_ACCOUNT_INACTIVE | Account is inactive |
 | 403 | AUTH_ACCOUNT_BLOCKED | Account is blocked |
 | 403 | AUTH_EMAIL_NOT_VERIFIED | Email verification is required |
+| 403 | AUTH_SELLER_NOT_APPROVED | Seller account is not approved |
 | 404 | AUTH_USER_NOT_FOUND | User not found, only where safe to expose |
+| 409 | AUTH_EMAIL_ALREADY_EXISTS | Email is already registered |
+| 409 | AUTH_USERNAME_ALREADY_EXISTS | Username is already registered |
 | 409 | AUTH_EMAIL_ALREADY_VERIFIED | Email is already verified |
 | 429 | AUTH_TOO_MANY_ATTEMPTS | Rate limit exceeded |
 | 500 | AUTH_INTERNAL_ERROR | Unexpected internal error |
@@ -533,6 +587,7 @@ All endpoints must use a consistent error-response structure.
 
 - Unknown email and wrong password must both return `Invalid email or password`.
 - Forgot-password must not reveal whether an email exists.
+- Duplicate email and username race-condition database errors must return sanitized `409 Conflict` responses.
 - SQL errors, stack traces and internal messages must not be returned.
 - Sensitive tokens must not appear in logs.
 
@@ -551,6 +606,7 @@ Authentication uses the existing `users` table.
 | id | BIGINT | Yes | User ID |
 | first_name | VARCHAR(100) | Yes | First name |
 | last_name | VARCHAR(100) | Yes | Last name |
+| username | VARCHAR(50) | Yes | Unique username |
 | email | VARCHAR(255) | Yes | Unique login email |
 | phone | VARCHAR(20) | No | Phone number |
 | password | VARCHAR(255) | Yes | BCrypt-encoded password |
@@ -565,6 +621,7 @@ Authentication uses the existing `users` table.
 **Required indexes**
 
 - Unique index on `email`
+- Unique index on `username`
 - Unique index on `phone` when phone is used
 - Index on `status`
 - Index on `user_type`
@@ -685,6 +742,7 @@ Authentication uses the existing `users` table.
 | POST | `/api/v1/auth/resend-verification` | Public | Resend verification |
 | PUT | `/api/v1/auth/change-password` | Bearer token | Change password |
 | GET | `/api/v1/auth/me` | Bearer token | Get current user |
+| GET | `/api/v1/auth/csrf` | Public | Get CSRF token |
 
 ---
 
@@ -710,13 +768,13 @@ POST /api/v1/auth/login
   "message": "Login successful",
   "data": {
     "accessToken": "jwt-access-token",
-    "refreshToken": "refresh-token",
     "accessTokenExpiresIn": 900,
     "refreshTokenExpiresIn": 604800,
     "user": {
       "id": 1,
       "firstName": "Mahendra",
       "lastName": "Singh",
+      "username": "mahendra.singh",
       "email": "customer@example.com",
       "userType": "CUSTOMER",
       "roles": ["CUSTOMER"],
@@ -725,6 +783,8 @@ POST /api/v1/auth/login
   }
 }
 ```
+
+The raw refresh token must be sent through the configured HTTP-only refresh-token cookie, not in this JSON body.
 
 ---
 
@@ -736,11 +796,7 @@ POST /api/v1/auth/refresh-token
 
 #### Request
 
-```json
-{
-  "refreshToken": "refresh-token"
-}
-```
+The client sends the configured HTTP-only refresh-token cookie.
 
 #### Success Response
 
@@ -749,12 +805,31 @@ POST /api/v1/auth/refresh-token
   "message": "Token refreshed successfully",
   "data": {
     "accessToken": "new-access-token",
-    "refreshToken": "new-refresh-token",
     "accessTokenExpiresIn": 900,
     "refreshTokenExpiresIn": 604800
   }
 }
 ```
+
+The rotated raw refresh token must be sent through the configured HTTP-only refresh-token cookie.
+
+---
+
+### 11.4A CSRF Token API
+
+```http
+GET /api/v1/auth/csrf
+```
+
+This endpoint must be public so unauthenticated users can fetch a CSRF token before calling login.
+
+The server must use a single configured CSRF header name consistently across:
+
+- CSRF token repository
+- Frontend request header
+- CORS allowed headers
+
+The current configured header is `X-XSRF-TOKEN`.
 
 ---
 
@@ -1062,14 +1137,25 @@ security
 ### Login
 
 - [ ] An active registered user can log in with the correct email and password.
-- [ ] Successful login returns an access token and refresh token.
+- [ ] Successful login returns an access token in the response body.
+- [ ] Successful login sends the refresh token through an HTTP-only cookie.
 - [ ] The access token contains user identity and role information.
 - [ ] Incorrect credentials return `401 Unauthorized`.
 - [ ] Unknown email and wrong password return the same error message.
+- [ ] Login DTO validation does not enforce registration password-complexity rules.
 - [ ] An inactive user cannot log in.
 - [ ] A blocked user cannot log in.
 - [ ] Passwords are verified using BCrypt.
 - [ ] Successful and failed login attempts are recorded.
+
+### Registration
+
+- [ ] Public registration accepts `CUSTOMER` and `SELLER`.
+- [ ] Public registration rejects `ADMIN`.
+- [ ] Registration requires a unique email and username.
+- [ ] Duplicate email database races return `409 Conflict`.
+- [ ] Duplicate username database races return `409 Conflict`.
+- [ ] Registered accounts start as `PENDING` and `email_verified=false`.
 
 ### Access and Refresh Tokens
 
@@ -1083,6 +1169,8 @@ security
 - [ ] Revoked refresh tokens are rejected.
 - [ ] Blocked or inactive users cannot refresh tokens.
 - [ ] Refresh tokens are stored as hashes.
+- [ ] CSRF token endpoint is public.
+- [ ] CSRF token repository, frontend header and CORS allowed headers use the same header name.
 
 ### Logout
 
