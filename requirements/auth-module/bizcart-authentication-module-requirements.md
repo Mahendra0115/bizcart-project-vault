@@ -27,6 +27,8 @@ The module provides:
 - Password change
 - Current authenticated-user retrieval
 - Login-attempt tracking
+- Google OAuth 2.0 social login
+- Phone OTP verification using Redis
 
 ---
 
@@ -49,15 +51,14 @@ The module provides:
 - Validating account status before login or token refresh
 - Including role and permission details in the authenticated session
 - Tracking successful and failed login attempts
+- Google OAuth 2.0 login
+- Phone OTP verification using Redis
 
 ### 3.2 Out of Scope
 
 The first version will not include:
 
-- Google login
-- Facebook login
 - Apple login
-- Phone OTP login
 - Two-factor authentication
 - Biometric authentication
 - CAPTCHA integration
@@ -373,6 +374,13 @@ The record should contain:
 
 ---
 
+### FR-AUTH-015 — Google OAuth 2.0 Login
+
+### FR-AUTH-016 — Phone OTP Verification
+
+
+
+
 ## 6. Non-Functional Requirements
 
 ### 6.1 Security
@@ -383,6 +391,23 @@ The record should contain:
 - Passwords must be encoded using BCrypt.
 - Passwords must never be returned by an API.
 - Passwords must not be written to logs.
+
+#### OAuth Security
+
+- Google Client ID and Client Secret must come from environment variables.
+- Google Client Secret must not be committed to Git.
+- Only verified Google emails should be accepted.
+- Google access token must not be exposed to the frontend.
+- BizCart backend must generate its own JWT after successful OAuth login.
+
+#### Phone OTP Security
+
+- OTP must be 6 digit random numeric value.
+- OTP must be stored as hash in Redis.
+- OTP expiry must be 5 minutes.
+- Maximum verification attempts must be 3.
+- OTP must be deleted after successful verification.
+- In local profile, OTP must be printed only in backend console.
 
 #### Token Security
 
@@ -540,6 +565,22 @@ Login must not reject a password only because it does not match the registration
 - New password and confirmation password must match.
 
 ---
+### 8.8 Phone Number
+
+- Required for phone OTP verification.
+- Must be trimmed before processing.
+- Must be valid Indian mobile number format.
+- Must be unique when linked with a user account.
+
+### 8.9 Phone OTP
+
+- Required
+- Must be 6 digits
+- Must contain only numbers
+- Must not be expired
+- Must not exceed 3 failed attempts
+
+
 
 ## 9. Error Handling and Exception Cases
 
@@ -583,6 +624,13 @@ All endpoints must use a consistent error-response structure.
 | 429 | AUTH_TOO_MANY_ATTEMPTS | Rate limit exceeded |
 | 500 | AUTH_INTERNAL_ERROR | Unexpected internal error |
 
+| 400 | AUTH_INVALID_OTP | Invalid phone OTP |
+| 400 | AUTH_OTP_EXPIRED | Phone OTP expired |
+| 400 | AUTH_OTP_MAX_ATTEMPTS_EXCEEDED | Maximum OTP attempts exceeded |
+| 400 | AUTH_OAUTH_LOGIN_FAILED | Google OAuth login failed |
+| 409 | AUTH_PHONE_ALREADY_VERIFIED | Phone number already verified |
+| 429 | AUTH_OTP_RESEND_LIMIT_EXCEEDED | OTP resend cooldown active |
+
 ### 9.3 Security Rules for Errors
 
 - Unknown email and wrong password must both return `Invalid email or password`.
@@ -617,6 +665,11 @@ Authentication uses the existing `users` table.
 | last_login_at | DATETIME | No | Last successful login |
 | created_at | DATETIME | Yes | Creation time |
 | updated_at | DATETIME | Yes | Update time |
+
+| phone_verified | BOOLEAN | Yes | Phone-verification state |
+| auth_provider | ENUM | Yes | LOCAL or GOOGLE |
+| provider_id | VARCHAR(255) | No | Google provider user ID |
+| provider_email | VARCHAR(255) | No | Email received from OAuth provider |
 
 **Required indexes**
 
@@ -712,6 +765,26 @@ Authentication uses the existing `users` table.
 | failure_reason | VARCHAR(255) | No | Failure reason |
 | attempted_at | DATETIME | Yes | Attempt time |
 
+
+### 10.6 Redis Data: PhoneOtp
+
+Phone OTP data will be stored in Redis, not MySQL.
+
+Redis key format:
+
+`otp:phone:{phoneNumber}:{purpose}`
+
+Redis value should contain:
+
+- OTP hash
+- Phone number
+- Purpose
+- Attempt count
+- Expiry time
+
+TTL must be 5 minutes.
+
+
 **Required indexes**
 
 - Index on `email`
@@ -743,6 +816,11 @@ Authentication uses the existing `users` table.
 | PUT | `/api/v1/auth/change-password` | Bearer token | Change password |
 | GET | `/api/v1/auth/me` | Bearer token | Get current user |
 | GET | `/api/v1/auth/csrf` | Public | Get CSRF token |
+
+| GET | `/api/v1/auth/oauth2/google` | Public | Start Google OAuth login |
+| GET | `/api/v1/auth/oauth2/callback/google` | Public | Handle Google OAuth callback |
+| POST | `/api/v1/auth/phone/send-otp` | Public | Send phone verification OTP |
+| POST | `/api/v1/auth/phone/verify-otp` | Public | Verify phone OTP |
 
 ---
 
@@ -1003,6 +1081,14 @@ PUT /api/v1/auth/change-password
 GET /api/v1/auth/me
 ```
 
+### 11.13 Google OAuth Login API
+
+### 11.14 Google OAuth Callback API
+
+### 11.15 Send Phone OTP API
+
+### 11.16 Verify Phone OTP API
+
 #### Success Response
 
 ```json
@@ -1039,6 +1125,9 @@ GET /api/v1/auth/me
 - `ResendVerificationRequestDto`
 - `ChangePasswordRequestDto`
 
+- `SendPhoneOtpRequestDto`
+- `VerifyPhoneOtpRequestDto`
+
 ### Response DTOs
 
 - `LoginResponseDto`
@@ -1046,6 +1135,8 @@ GET /api/v1/auth/me
 - `AuthenticatedUserResponseDto`
 - `MessageResponseDto`
 
+- `OAuthLoginResponseDto`
+- `PhoneOtpResponseDto`
 ---
 
 ## 13. Suggested Spring Boot Structure
@@ -1053,7 +1144,10 @@ GET /api/v1/auth/me
 ```text
 auth
 ├── controller
-│   └── AuthController.java
+│   ├── AuthController.java
+│   ├── OAuthController.java
+│   └── PhoneOtpController.java
+│
 ├── dto
 │   ├── request
 │   │   ├── LoginRequestDto.java
@@ -1063,32 +1157,62 @@ auth
 │   │   ├── ResetPasswordRequestDto.java
 │   │   ├── VerifyEmailRequestDto.java
 │   │   ├── ResendVerificationRequestDto.java
-│   │   └── ChangePasswordRequestDto.java
+│   │   ├── ChangePasswordRequestDto.java
+│   │   ├── SendPhoneOtpRequestDto.java
+│   │   └── VerifyPhoneOtpRequestDto.java
+│   │
 │   └── response
 │       ├── LoginResponseDto.java
 │       ├── TokenResponseDto.java
-│       └── AuthenticatedUserResponseDto.java
+│       ├── AuthenticatedUserResponseDto.java
+│       ├── OAuthLoginResponseDto.java
+│       ├── PhoneOtpResponseDto.java
+│       └── MessageResponseDto.java
+│
 ├── entity
 │   ├── RefreshToken.java
 │   ├── PasswordResetToken.java
 │   ├── VerificationToken.java
 │   └── LoginAttempt.java
+│
 ├── repository
 │   ├── RefreshTokenRepository.java
 │   ├── PasswordResetTokenRepository.java
 │   ├── VerificationTokenRepository.java
 │   └── LoginAttemptRepository.java
+│
 ├── service
 │   ├── AuthService.java
 │   ├── TokenService.java
 │   ├── PasswordService.java
-│   └── EmailVerificationService.java
+│   ├── EmailVerificationService.java
+│   ├── OAuthService.java
+│   ├── PhoneOtpService.java
+│   └── SmsService.java
+│
+├── service/impl
+│   ├── AuthServiceImpl.java
+│   ├── TokenServiceImpl.java
+│   ├── PasswordServiceImpl.java
+│   ├── EmailVerificationServiceImpl.java
+│   ├── GoogleOAuthServiceImpl.java
+│   ├── PhoneOtpServiceImpl.java
+│   └── ConsoleSmsServiceImpl.java
+│
+├── config
+│   ├── OAuth2Config.java
+│   └── RedisConfig.java
+│
 └── exception
     ├── InvalidCredentialsException.java
     ├── InvalidTokenException.java
     ├── TokenExpiredException.java
     ├── AccountBlockedException.java
-    └── AccountInactiveException.java
+    ├── AccountInactiveException.java
+    ├── OAuthLoginFailedException.java
+    ├── InvalidOtpException.java
+    ├── OtpExpiredException.java
+    └── OtpMaxAttemptsExceededException.java
 ```
 
 Shared security classes may remain under the global `security` package:
@@ -1098,7 +1222,9 @@ security
 ├── SecurityConfig.java
 ├── JwtTokenProvider.java
 ├── JwtAuthenticationFilter.java
-└── CustomUserDetailsService.java
+├── CustomUserDetailsService.java
+├── OAuth2SuccessHandler.java
+└── CustomOAuth2UserService.java
 ```
 
 ---
@@ -1116,6 +1242,10 @@ security
 - Access-token validation is stateless.
 - Refresh tokens are stored in the database.
 
+- Redis will be available for local Phone OTP verification.
+- Local profile will use console-based SMS simulation.
+- Google OAuth credentials will be supplied through environment variables.
+
 ---
 
 ## 15. Constraints
@@ -1129,6 +1259,9 @@ security
 - Secrets must never be committed to Git.
 - The module must follow the common BizCart response and exception formats.
 - Authentication implementation must not break User, Role or Store modules.
+
+- Facebook and Apple social login are not included in this phase.
+- Phone OTP is supported only for verification in local profile; real SMS gateway is not included in this phase.
 
 ---
 
@@ -1147,6 +1280,25 @@ security
 - [ ] A blocked user cannot log in.
 - [ ] Passwords are verified using BCrypt.
 - [ ] Successful and failed login attempts are recorded.
+
+### Google OAuth 2.0 Login
+
+- [ ] User can start Google OAuth login.
+- [ ] Google callback is handled successfully.
+- [ ] Existing Google user can log in.
+- [ ] New Google user can be created.
+- [ ] Backend generates BizCart JWT after OAuth login.
+- [ ] Google Client Secret is not exposed.
+
+### Phone OTP Verification
+
+- [ ] User can request phone OTP.
+- [ ] Local profile prints OTP in backend console.
+- [ ] OTP is stored in Redis with 5 minutes TTL.
+- [ ] OTP is verified successfully when correct.
+- [ ] Wrong OTP increases attempt count.
+- [ ] OTP becomes invalid after 3 wrong attempts.
+- [ ] OTP is deleted after successful verification.
 
 ### Registration
 

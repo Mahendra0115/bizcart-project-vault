@@ -10,7 +10,7 @@
 | Database            | MySQL                                           |
 | Document Type       | Technical Approach                              |
 | Status              | Ready for Development                           |
-| Version             | 1.1                                             |
+| Version             | 1.2                                             |
 | Related Requirement | `bizcart-authentication-module-requirements.md` |
 | API Base Path       | `/api/v1/auth`                                  |
 
@@ -28,6 +28,8 @@ The module will use:
 * HMAC-SHA-256 for refresh, reset and verification-token hashing
 * Spring Security for authentication and authorisation
 * MySQL for persistent session and token storage
+* Spring Security OAuth2 Client for Google OAuth 2.0 social login
+* Redis for local phone OTP verification storage and expiry management
 
 The module will support:
 
@@ -45,6 +47,10 @@ The module will support:
 * Account-status validation
 * Login-attempt tracking
 * Roles and permissions in the authenticated session
+* Google OAuth 2.0 social login
+* Phone OTP verification using Redis in the local Spring profile
+* Google OAuth 2.0 for social login
+* Redis for local phone OTP verification
 
 This document explains how the Authentication requirements will be implemented in the BizCart Spring Boot monolithic backend.
 
@@ -69,7 +75,11 @@ The module must:
 * Provide roles and permissions to downstream modules.
 * Track successful and failed login attempts.
 * Follow common BizCart validation and exception formats.
-* Support future Redis, social login and two-factor authentication integration.
+
+* Support Google OAuth 2.0 social login.
+* Support Redis-backed phone OTP verification in the local profile.
+* Keep two-factor authentication available for future enhancement.
+
 
 ---
 
@@ -190,6 +200,46 @@ Requirements:
 | Email-verification token |   24 hours |
 
 All expiry durations must be configurable through environment properties.
+
+
+### 3.7 Google OAuth 2.0 Decision
+
+BizCart will support Google OAuth 2.0 login as a social-login option.
+
+Google OAuth will be used only for external identity verification.
+
+BizCart will still generate its own JWT access token and refresh-token session after successful Google login.
+
+The backend will receive user information from Google and map it to the internal BizCart user account.
+
+The initial OAuth provider will be:
+
+```text
+GOOGLE
+```
+
+Future providers such as Facebook, GitHub or Apple may be added later.
+
+Google OAuth credentials must be supplied through environment variables and must never be committed to Git.
+
+### 3.8 Phone OTP Verification Decision
+
+BizCart will support phone OTP verification.
+
+For the local Spring profile, the OTP implementation will use the following approach:
+
+```text
+Spring profile: local
+OTP: Random 6 digit
+SMS: Console log only
+Storage: Redis
+Expiry: 5 minutes
+Max attempts: 3
+```
+
+Real SMS gateway integration is not part of the local implementation.
+
+In local development, the generated OTP will be printed in the backend console for testing through Postman or frontend.
 
 ---
 
@@ -519,6 +569,61 @@ The endpoint must not return:
 
 ---
 
+
+### 4.14 Google OAuth 2.0 Login Flow
+
+1. The user clicks "Login with Google" on the frontend.
+2. The frontend redirects the user to the backend Google OAuth start endpoint.
+3. The backend redirects the user to Google OAuth consent screen.
+4. The user selects a Google account and grants permission.
+5. Google redirects back to the backend callback endpoint with an authorization code.
+6. The backend exchanges the authorization code for Google user information.
+7. The backend validates that the Google email is verified.
+8. The backend searches the user by email.
+9. If the user exists, the system logs in the existing user.
+10. If the user does not exist, the system creates a new user with provider `GOOGLE`.
+11. The backend generates a BizCart JWT access token.
+12. The backend generates a BizCart refresh token.
+13. The refresh token is stored as a hash.
+14. The raw refresh token is sent through an HTTP-only cookie.
+15. The access token and safe user details are returned or redirected to the frontend.
+
+Google OAuth must not replace BizCart JWT logic.  
+OAuth is used only to verify the external identity.
+
+
+
+
+### 4.15 Phone OTP Verification Flow
+
+1. The user submits a phone number and OTP purpose.
+2. The backend validates the phone number.
+3. The backend generates a random 6 digit OTP.
+4. The OTP is hashed before storage.
+5. The OTP data is stored in Redis.
+6. Redis TTL is set to 5 minutes.
+7. In the local profile, the OTP is printed in the backend console.
+8. The user submits the OTP for verification.
+9. The backend reads the OTP data from Redis.
+10. The backend checks OTP expiry and attempt count.
+11. If the OTP is wrong, attempt count is increased.
+12. After 3 wrong attempts, the OTP becomes invalid.
+13. If the OTP is correct, the phone number is marked as verified.
+14. After successful verification, the OTP key is deleted from Redis.
+
+Redis key format:
+
+```text
+otp:phone:{phoneNumber}:{purpose}
+```
+
+Example:
+
+```text
+otp:phone:9876543210:PHONE_VERIFICATION
+```
+
+
 ## 5. Technology Stack and Justification
 
 | Technology                   | Usage                            | Reason                                                       |
@@ -526,9 +631,11 @@ The endpoint must not return:
 | Java 21                      | Backend language                 | LTS release and modern Java features                         |
 | Spring Boot                  | Application framework            | Simplifies REST, configuration and dependency injection      |
 | Spring Security              | Authentication and authorisation | Standard security filter chain and access control            |
+| Spring Security OAuth2 Client | Google OAuth 2.0 login           | Standard OAuth2 client support for Google login              |
 | Spring Data JPA              | Persistence                      | Repository abstraction and parameterised queries             |
 | Hibernate                    | ORM                              | Entity-to-table mapping                                      |
 | MySQL 8                      | Primary database                 | Reliable relational storage                                  |
+| Redis                        | Phone OTP storage                | Fast temporary OTP storage with TTL support                  |
 | JWT library                  | Access tokens                    | Stateless authentication                                     |
 | BCrypt                       | Password hashing                 | Adaptive and salted password protection                      |
 | HMAC-SHA-256                 | Token hashing                    | Deterministic secure token lookup using a server-side pepper |
@@ -551,15 +658,23 @@ The module will use a practical layered structure suitable for the BizCart monol
 ```text
 authentication/
 ├── AuthController.java
+├── OAuthController.java
+├── PhoneOtpController.java
 ├── AuthService.java
 ├── JwtService.java
 ├── RefreshTokenService.java
 ├── PasswordService.java
 ├── VerificationService.java
+├── OAuthService.java
+├── PhoneOtpService.java
+├── SmsService.java
+├── ConsoleSmsService.java
 │
 ├── dto/
 │   ├── request/
 │   │   ├── LoginRequest.java
+│   │   ├── SendPhoneOtpRequest.java
+│   │   ├── VerifyPhoneOtpRequest.java
 │   │   ├── ForgotPasswordRequest.java
 │   │   ├── ResetPasswordRequest.java
 │   │   ├── VerifyEmailRequest.java
@@ -568,6 +683,8 @@ authentication/
 │   │
 │   └── response/
 │       ├── LoginResponse.java
+│       ├── OAuthLoginResponse.java
+│       ├── PhoneOtpResponse.java
 │       ├── TokenResponse.java
 │       ├── CurrentUserResponse.java
 │       └── MessageResponse.java
@@ -597,7 +714,9 @@ authentication/
 │   └── AccountInactiveException.java
 │
 └── config/
-    └── AuthenticationProperties.java
+    ├── AuthenticationProperties.java
+    ├── OAuth2Config.java
+    └── RedisConfig.java
 ```
 
 Shared security classes:
@@ -652,9 +771,61 @@ Required indexes:
 
 Emails must be stored in lowercase.
 
+Additional fields required for Google OAuth 2.0 and phone OTP verification:
+
+```text
+phone_verified
+auth_provider
+provider_id
+provider_email
+```
+
+`auth_provider` will initially support:
+
+```text
+LOCAL
+GOOGLE
+```
+
+`provider_id` must store the unique Google user ID received from Google OAuth.
+
+`phone_verified` will be updated only after successful phone OTP verification.
+
 ---
 
-## 7.2 Refresh Tokens Table
+## 7.2 Redis Phone OTP Data
+
+Phone OTP data will be stored in Redis because OTP is temporary security data.
+
+Redis key format:
+
+```text
+otp:phone:{phoneNumber}:{purpose}
+```
+
+Example:
+
+```text
+otp:phone:9876543210:PHONE_VERIFICATION
+```
+
+Redis value must contain:
+
+```text
+otp_hash
+phone_number
+purpose
+attempt_count
+expires_at
+```
+
+Redis TTL must be 5 minutes.
+
+OTP must be deleted from Redis after successful verification.
+
+---
+
+## 7.3 Refresh Tokens Table
 
 ```text
 refresh_tokens
@@ -683,7 +854,7 @@ Required indexes:
 
 ---
 
-## 7.3 Password Reset Tokens Table
+## 7.4 Password Reset Tokens Table
 
 ```text
 password_reset_tokens
@@ -705,7 +876,7 @@ Required indexes:
 
 ---
 
-## 7.4 Verification Tokens Table
+## 7.5 Verification Tokens Table
 
 ```text
 verification_tokens
@@ -728,7 +899,7 @@ Required indexes:
 
 ---
 
-## 7.5 Login Attempts Table
+## 7.6 Login Attempts Table
 
 ```text
 login_attempts
@@ -755,7 +926,7 @@ The retention period must be configurable.
 
 ---
 
-## 7.6 Token Hashing
+## 7.7 Token Hashing
 
 Refresh, reset and verification tokens will use:
 
@@ -774,7 +945,7 @@ Passwords will continue to use BCrypt.
 
 ---
 
-## 7.7 Transaction Management
+## 7.8 Transaction Management
 
 The following operations must be transactional:
 
@@ -785,13 +956,21 @@ The following operations must be transactional:
 * Password change
 * Email verification
 * Logout-all
+* Google OAuth callback success
+* Google OAuth existing-user login
+* Google OAuth new-user creation
+* Phone OTP generation
+* Phone OTP verification success
+* Phone OTP invalid attempt count
+* Phone OTP expiry
+* Phone OTP max-attempt failure
 * Verification-token replacement
 
 Failed login-attempt tracking must use a separate transaction so that the record is not rolled back with the authentication failure.
 
 ---
 
-## 7.8 Cleanup Jobs
+## 7.9 Cleanup Jobs
 
 A scheduled cleanup process will remove or archive:
 
@@ -827,6 +1006,10 @@ Retention values must remain configurable.
 | POST   | `/api/v1/auth/resend-verification` | Public                | Resend verification email |
 | PUT    | `/api/v1/auth/change-password`     | Bearer token          | Change password           |
 | GET    | `/api/v1/auth/me`                  | Bearer token          | Get current user          |
+| GET    | `/api/v1/auth/oauth2/google`       | Public                | Start Google OAuth login  |
+| GET    | `/api/v1/auth/oauth2/callback/google` | Public             | Handle Google OAuth callback |
+| POST   | `/api/v1/auth/phone/send-otp`      | Public                | Generate local phone OTP  |
+| POST   | `/api/v1/auth/phone/verify-otp`    | Public                | Verify local phone OTP    |
 
 ---
 
@@ -857,7 +1040,86 @@ The refresh token will be set through an HttpOnly cookie.
 
 ---
 
-## 8.3 Error Response
+## 8.3 Google OAuth 2.0 API Flow
+
+### Start Google OAuth Login
+
+```http
+GET /api/v1/auth/oauth2/google
+```
+
+Purpose:
+
+```text
+Redirect the user to the Google OAuth consent screen.
+```
+
+### Google OAuth Callback
+
+```http
+GET /api/v1/auth/oauth2/callback/google
+```
+
+Purpose:
+
+```text
+Receive Google authorization code, fetch Google user information, create or find the BizCart user, and issue BizCart tokens.
+```
+
+After successful Google login, the backend must generate the same BizCart access token and refresh-token cookie used by normal login.
+
+---
+
+## 8.4 Phone OTP API Flow
+
+### Send Phone OTP
+
+```http
+POST /api/v1/auth/phone/send-otp
+```
+
+Request:
+
+```json
+{
+  "phoneNumber": "9876543210",
+  "purpose": "PHONE_VERIFICATION"
+}
+```
+
+Local behaviour:
+
+```text
+The backend generates a random 6 digit OTP, stores the OTP hash in Redis and prints the OTP in the backend console.
+```
+
+### Verify Phone OTP
+
+```http
+POST /api/v1/auth/phone/verify-otp
+```
+
+Request:
+
+```json
+{
+  "phoneNumber": "9876543210",
+  "otp": "482915",
+  "purpose": "PHONE_VERIFICATION"
+}
+```
+
+Verification rules:
+
+* OTP must match the Redis OTP hash.
+* OTP must not be expired.
+* OTP must not exceed 3 failed attempts.
+* OTP must be deleted after successful verification.
+* User phone verification status must be updated after successful verification.
+
+---
+
+## 8.5 Error Response
 
 ```json
 {
@@ -894,6 +1156,12 @@ The refresh token will be set through an HttpOnly cookie.
 |         403 | `AUTH_ACCOUNT_APPROVAL_PENDING`     |
 |         409 | `AUTH_EMAIL_ALREADY_VERIFIED`       |
 |         429 | `AUTH_TOO_MANY_ATTEMPTS`            |
+|         400 | `AUTH_INVALID_OTP`                  |
+|         410 | `AUTH_OTP_EXPIRED`                  |
+|         429 | `AUTH_OTP_MAX_ATTEMPTS_EXCEEDED`    |
+|         429 | `AUTH_OTP_RESEND_LIMIT_EXCEEDED`    |
+|         401 | `AUTH_OAUTH_LOGIN_FAILED`           |
+|         409 | `AUTH_PHONE_ALREADY_VERIFIED`       |
 |         500 | `AUTH_INTERNAL_ERROR`               |
 
 ---
@@ -991,6 +1259,28 @@ Deployed environments should configure:
 * Frontend-level Content Security Policy
 * Restricted CORS origins
 
+### 9.8 Google OAuth Security
+
+* Google Client ID and Client Secret must be loaded from environment variables.
+* Google Client Secret must never be exposed to the frontend.
+* Google access token must not be returned in the BizCart API response.
+* Only verified Google email addresses will be accepted.
+* BizCart will generate its own JWT after successful OAuth login.
+* Duplicate user creation must be prevented using email uniqueness.
+* Google OAuth must not bypass account status validation.
+
+### 9.9 Phone OTP Security
+
+* OTP must be a random 6 digit numeric value.
+* OTP must be stored as hash in Redis.
+* OTP must expire after 5 minutes.
+* Maximum failed verification attempts must be 3.
+* OTP must be deleted after successful verification.
+* OTP must not be stored in MySQL for the local implementation.
+* OTP must not be returned in the API response.
+* In the local profile only, OTP may be printed in the backend console.
+* Real SMS gateway integration will be added later for deployed environments.
+
 ---
 
 ## 10. Testing Approach
@@ -1004,6 +1294,9 @@ Primary targets:
 * `RefreshTokenService`
 * `PasswordService`
 * `VerificationService`
+* `OAuthService`
+* `PhoneOtpService`
+* `SmsService`
 * `AuthMapper`
 
 Important scenarios:
@@ -1109,6 +1402,28 @@ Create pending customer
 → Confirm token cannot be reused
 ```
 
+### Google OAuth 2.0
+
+```text
+Start OAuth login
+→ Mock Google callback
+→ Fetch Google user info
+→ Create or find BizCart user
+→ Generate BizCart access token
+→ Verify refresh-token cookie
+```
+
+### Phone OTP Verification
+
+```text
+Send OTP
+→ Verify Redis key and TTL
+→ Read OTP from local console or mocked SMS service
+→ Verify OTP
+→ Confirm phone_verified=true
+→ Confirm Redis OTP key deleted
+```
+
 ---
 
 ## 10.5 Performance Targets
@@ -1144,6 +1459,10 @@ Performance tests must use an agreed test load and production-like BCrypt config
 | Role changes after login                | New access token on refresh and short token expiry            |
 | Database outage                         | Health checks, connection pooling and database monitoring     |
 | Misconfigured environment URL           | Separate frontend URLs per environment                        |
+| Google OAuth credential exposure         | Store OAuth client secret only in environment configuration    |
+| OAuth duplicate account creation         | Match users by unique email and provider ID                    |
+| OTP brute-force attempts                 | Redis TTL, max attempts and resend cooldown                    |
+| OTP leakage in deployed logs             | Console OTP printing allowed only in local profile             |
 
 ---
 
@@ -1162,6 +1481,9 @@ Performance tests must use an agreed test load and production-like BCrypt config
 * Access tokens are stored in memory.
 * Refresh tokens are stored only in HttpOnly cookies.
 * Server clocks are synchronised.
+* Redis is available for local phone OTP verification.
+* Local profile uses console-based SMS simulation.
+* Google OAuth credentials are available through environment variables.
 
 ### Internal Dependencies
 
@@ -1173,6 +1495,8 @@ Performance tests must use an agreed test load and production-like BCrypt config
 * Spring Security configuration
 * Flyway configuration
 * Email or notification abstraction
+* Google OAuth provider configuration
+* Redis configuration for local OTP storage
 * Audit and logging configuration
 
 ### External Dependencies
@@ -1220,16 +1544,27 @@ REFRESH_RATE_LIMIT
 VERIFICATION_RATE_LIMIT
 
 LOGIN_ATTEMPT_RETENTION_DAYS
+
+GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_SECRET
+GOOGLE_OAUTH_REDIRECT_URI
+
+REDIS_HOST
+REDIS_PORT
+OTP_LENGTH
+OTP_EXPIRY_MINUTES
+OTP_MAX_ATTEMPTS
+OTP_SMS_MODE
 ```
 
 ---
 
 ## 14. Out of Scope for Version One
 
-* Google login
+* Facebook, Apple and other social-login providers except Google OAuth 2.0
 * Facebook login
 * Apple login
-* Phone OTP
+* Real SMS gateway integration for Phone OTP in deployed environments
 * Two-factor authentication
 * Biometric authentication
 * CAPTCHA
@@ -1238,7 +1573,7 @@ LOGIN_ATTEMPT_RETENTION_DAYS
 * Active-session list UI
 * Manual selective device revocation UI
 * Access-token blacklist
-* Redis-based distributed rate limiting
+* Redis-based distributed rate limiting beyond local OTP storage
 * Security-notification dashboard
 * Password-compromise database integration
 
@@ -1263,10 +1598,12 @@ LOGIN_ATTEMPT_RETENTION_DAYS
 15. Implement password change.
 16. Add login-attempt tracking.
 17. Add rate limiting.
-18. Add token cleanup job.
-19. Add Swagger documentation.
-20. Add unit and integration tests.
-21. Perform security and QA validation.
+18. Implement Google OAuth 2.0 login.
+19. Implement Redis-backed local phone OTP verification.
+20. Add token cleanup job.
+21. Add Swagger documentation.
+22. Add unit and integration tests.
+23. Perform security and QA validation.
 
 ---
 
@@ -1290,4 +1627,6 @@ The Authentication module will be considered ready for release when:
 * Swagger documentation is complete.
 * Unit and integration tests pass.
 * Flyway migrations work on a clean MySQL database.
+* Google OAuth 2.0 login works for existing and new users.
+* Local phone OTP verification works with Redis, 5-minute TTL and 3 max attempts.
 * QA checklist is completed.
